@@ -16,8 +16,8 @@ on:
 
 permissions:
   contents: read
-  pages: write       # requis par deploy-pages
-  id-token: write    # requis par deploy-pages
+  pages: write
+  id-token: write
 
 jobs:
   build:
@@ -36,200 +36,161 @@ jobs:
           npm init -y
           npm i @octokit/graphql dayjs
 
-      - name: Compute metrics & generate static site
+      - name: Compute metrics (GraphQL GitHub) & write JSON
         env:
-          # Utilise un PAT si présent (confort rate-limit) sinon GITHUB_TOKEN
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           OWNERS_REPOS: ${{ github.event.inputs.owners_repos }}
           MONTHS: ${{ github.event.inputs.months }}
         run: |
           mkdir -p site/data
           node <<'NODE'
-          // --- imports
           const { graphql } = require("@octokit/graphql");
           const dayjs = require("dayjs");
           const months = parseInt(process.env.MONTHS || "12", 10);
           const sinceISO = dayjs().subtract(months, "month").toISOString();
-          const listRepos = (process.env.OWNERS_REPOS || "codegouvfr/react-dsfr")
-                            .split(/\s+/).filter(Boolean);
-
-          const gh = graphql.defaults({
-            headers: { authorization: `token ${process.env.GH_TOKEN}` }
-          });
-
-          const query = `
-            query($owner:String!, $name:String!, $cursor:String) {
-              repository(owner:$owner, name:$name) {
-                pullRequests(first:100, after:$cursor, states:MERGED,
-                  orderBy:{field:UPDATED_AT, direction:DESC}) {
-                  pageInfo { hasNextPage endCursor }
-                  nodes {
-                    number
-                    createdAt
-                    mergedAt
-                    isDraft
-                  }
+          const repos = (process.env.OWNERS_REPOS || "codegouvfr/react-dsfr").split(/\s+/).filter(Boolean);
+          const gh = graphql.defaults({ headers: { authorization: `token ${process.env.GH_TOKEN}` }});
+          const q = `
+            query($owner:String!, $name:String!, $cursor:String){
+              repository(owner:$owner, name:$name){
+                pullRequests(first:100, after:$cursor, states:MERGED, orderBy:{field:UPDATED_AT, direction:DESC}){
+                  pageInfo{ hasNextPage endCursor }
+                  nodes{ number createdAt mergedAt isDraft }
                 }
               }
             }`;
 
-          async function fetchMerged(owner, name) {
-            let cursor=null, rows=[];
-            while (true) {
-              const r = await gh(query, { owner, name, cursor });
-              const pr = r.repository?.pullRequests?.nodes ?? [];
+          async function fetchMerged(owner, name){
+            let rows=[], cursor=null;
+            while(true){
+              const r=await gh(q,{owner,name,cursor});
+              const pr=r.repository?.pullRequests?.nodes??[];
               rows.push(...pr);
-              const pi = r.repository?.pullRequests?.pageInfo;
-              if (!pi?.hasNextPage) break;
-              cursor = pi.endCursor;
-              if (rows.length > 4000) break; // garde-fou
+              const pi=r.repository?.pullRequests?.pageInfo;
+              if(!pi?.hasNextPage) break;
+              cursor=pi.endCursor;
+              if(rows.length>4000) break;
             }
-            // Filtre période + non-draft
-            return rows.filter(x => x.mergedAt && x.createdAt
-              && dayjs(x.mergedAt).isAfter(sinceISO) && !x.isDraft)
-              .map(x => ({
-                number: x.number,
-                createdAt: x.createdAt,
-                mergedAt: x.mergedAt,
-                days: (new Date(x.mergedAt) - new Date(x.createdAt)) / 86400000
-              }));
+            return rows.filter(x=>x.mergedAt && x.createdAt && !x.isDraft && dayjs(x.mergedAt).isAfter(sinceISO))
+                       .map(x=>({ createdAt:x.createdAt, mergedAt:x.mergedAt, days:(new Date(x.mergedAt)-new Date(x.createdAt))/86400000 }));
           }
 
-          function stats(daysArr){
-            const s=[...daysArr].sort((a,b)=>a-b);
-            const n=s.length;
-            const sum=s.reduce((x,y)=>x+y,0);
-            const median = s[Math.floor(n/2)];
-            const p90    = s[Math.floor(n*0.90)];
-            const mean   = sum/n;
+          function stats(arr){
+            const s=[...arr].sort((a,b)=>a-b);
+            const n=s.length, sum=s.reduce((x,y)=>x+y,0);
+            const median = n ? s[Math.floor(n/2)] : 0;
+            const p90    = n ? s[Math.floor(n*0.90)] : 0;
+            const mean   = n ? sum/n : 0;
             return { n, median, mean, p90 };
           }
 
-          (async () => {
-            const projects = [];
-            for (const full of listRepos){
-              const [owner, name] = full.split("/");
-              const items = await fetchMerged(owner, name);
-              const byMonth = {};
-              for (const it of items){
+          (async ()=>{
+            const projects=[];
+            for(const full of repos){
+              const [owner,name]=full.split("/");
+              const items = await fetchMerged(owner,name);
+              const byMonth={};
+              for(const it of items){
                 const m = dayjs(it.mergedAt).format("YYYY-MM");
-                (byMonth[m] ??= []).push(it.days);
+                (byMonth[m]??=[]).push(it.days);
               }
-              const monthly = Object.keys(byMonth).sort()
-                .map(m => ({ month:m, ...stats(byMonth[m]) }));
-              projects.push({
-                repo: `${owner}/${name}`,
-                since: sinceISO,
-                overall: stats(items.map(x=>x.days)),
-                monthly
-              });
+              const monthly = Object.keys(byMonth).sort().map(m=>({ month:m, ...stats(byMonth[m]) }));
+              projects.push({ repo:`${owner}/${name}`, since: sinceISO, overall: stats(items.map(x=>x.days)), monthly });
             }
-
-            // overall multi-repo (si plusieurs)
-            const allDays = projects.flatMap(p => p.monthly.flatMap(m =>
-              Array(m.n).fill(0).map((_,i)=>m.median))); // approximation simple
-            // Pour l'overview global, on repart plutôt des items, mais
-            // pour limiter la mémoire sur gros périmètres, on se contente
-            // d'afficher un global = moyenne des médianes mensuelles :
-            const global = {
-              source: "median-of-monthly-medians",
-              value: projects
-                .flatMap(p => p.monthly.map(m=>m.median))
-                .reduce((s,x)=>s+x,0)
-            };
-
-            const payload = {
+            const fs=require("fs");
+            fs.mkdirSync("site/data",{recursive:true});
+            fs.writeFileSync("site/data/ttm.json", JSON.stringify({
               generatedAt: new Date().toISOString(),
               periodSince: sinceISO,
               projects
-            };
-
-            require("fs").writeFileSync("site/data/ttm.json", JSON.stringify(payload, null, 2));
-
-            // ---- Page statique (Chart.js) ----
-            require("fs").mkdirSync("site", { recursive:true });
-            require("fs").writeFileSync("site/index.html", `<!doctype html>
-<html lang="fr"><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>PR Time‑to‑Merge — Dashboard</title>
-<link rel="preconnect" href="https://cdn.jsdelivr.net">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
-<style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;margin:24px}
-  h1{margin:0 0 8px}
-  .grid{display:grid;grid-template-columns:1fr;gap:24px}
-  table{border-collapse:collapse;width:100%}
-  th,td{padding:8px 10px;border-bottom:1px solid #eee;text-align:right}
-  th:first-child,td:first-child{text-align:left}
-  .kpi{display:flex;gap:16px;flex-wrap:wrap}
-  .card{padding:12px 16px;border:1px solid #e5e7eb;border-radius:12px}
-  .small{color:#6b7280}
-  .section{margin-top:24px}
-</style></head>
-<body>
-<h1>PR Time‑to‑Merge (TTM)</h1>
-<div id="meta" class="small"></div>
-<div id="content"></div>
-
-<script>
-(async function(){
-  const res = await fetch("./data/ttm.json");
-  const data = await res.json();
-
-  const root = document.getElementById("content");
-  document.getElementById("meta").textContent =
-    \`Généré le \${new Date(data.generatedAt).toLocaleString()} • Période depuis \${new Date(data.periodSince).toLocaleDateString()}\`;
-
-  for (const p of data.projects){
-    const section = document.createElement("div");
-    section.className = "section";
-    section.innerHTML = \`<h2>\${p.repo}</h2>\`;
-
-    const kpi = document.createElement("div");
-    kpi.className="kpi";
-    kpi.innerHTML = \`
-      <div class="card"><b>Médiane</b>: \${(p.overall.median||0).toFixed(1)} j</div>
-      <div class="card"><b>Moyenne</b>: \${(p.overall.mean||0).toFixed(1)} j</div>
-      <div class="card"><b>p90</b>: \${(p.overall.p90||0).toFixed(1)} j</div>
-      <div class="card"><b>PR</b>: \${p.overall.n||0}</div>\`;
-    section.appendChild(kpi);
-
-    const labels = p.monthly.map(m=>m.month);
-    const mMedian = p.monthly.map(m=>m.median);
-    const mMean   = p.monthly.map(m=>m.mean);
-    const mP90    = p.monthly.map(m=>m.p90);
-
-    const canvas = document.createElement("canvas");
-    section.appendChild(canvas);
-    new Chart(canvas, {
-      type:"line",
-      data:{ labels,
-        datasets:[
-          { label:"Médiane (j)", data:mMedian, borderColor:"#2563eb", tension:.2 },
-          { label:"Moyenne (j)", data:mMean,   borderColor:"#10b981", tension:.2 },
-          { label:"p90 (j)",     data:mP90,    borderColor:"#f59e0b", tension:.2 }
-        ]},
-      options:{ responsive:true, scales:{ y:{ beginAtZero:true, title:{display:true,text:"jours"} } } }
-    });
-
-    const tbl = document.createElement("table");
-    tbl.innerHTML = \`<thead><tr><th>Mois</th><th>PR</th><th>Médiane (j)</th><th>Moyenne (j)</th><th>p90 (j)</th></tr></thead><tbody></tbody>\`;
-    const tbody = tbl.querySelector("tbody");
-    p.monthly.forEach(m=>{
-      const tr=document.createElement("tr");
-      tr.innerHTML = \`<td>\${m.month}</td><td>\${m.n}</td><td>\${m.median.toFixed(1)}</td><td>\${m.mean.toFixed(1)}</td><td>\${m.p90.toFixed(1)}</td>\`;
-      tbody.appendChild(tr);
-    });
-    section.appendChild(tbl);
-    root.appendChild(section);
-  }
-})();
-</script>
-</body></html>`);
+            }, null, 2));
+          })().catch(e=>{ console.error(e); process.exit(1); });
           NODE
 
-      - name: Configure Pages
+      - name: Generate static dashboard (index.html)
+        run: |
+          mkdir -p site
+          cat > site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="fr">
+          <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width,initial-scale=1"/>
+            <title>PR Time‑to‑Merge — Dashboard</title>
+            <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
+            <style>
+              body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;margin:24px}
+              h1{margin:0 0 8px}
+              .grid{display:grid;grid-template-columns:1fr;gap:24px}
+              table{border-collapse:collapse;width:100%}
+              th,td{padding:8px 10px;border-bottom:1px solid #eee;text-align:right}
+              th:first-child,td:first-child{text-align:left}
+              .kpi{display:flex;gap:16px;flex-wrap:wrap}
+              .card{padding:12px 16px;border:1px solid #e5e7eb;border-radius:12px}
+              .small{color:#6b7280}
+              .section{margin-top:24px}
+            </style>
+          </head>
+          <body>
+            <h1>PR Time‑to‑Merge (TTM)</h1>
+            <div id="meta" class="small"></div>
+            <div id="content"></div>
+
+            <script>
+              (async function(){
+                const r = await fetch("./data/ttm.json");
+                const d = await r.json();
+                document.getElementById("meta").textContent =
+                  `Généré le ${new Date(d.generatedAt).toLocaleString()} • Période depuis ${new Date(d.periodSince).toLocaleDateString()}`;
+                const root = document.getElementById("content");
+                d.projects.forEach(p=>{
+                  const sec = document.createElement("div");
+                  sec.className = "section";
+                  sec.innerHTML = `<h2>${p.repo}</h2>
+                    <div class="kpi">
+                      <div class="card"><b>Médiane</b>: ${(p.overall.median||0).toFixed(1)} j</div>
+                      <div class="card"><b>Moyenne</b>: ${(p.overall.mean||0).toFixed(1)} j</div>
+                      <div class="card"><b>p90</b>: ${(p.overall.p90||0).toFixed(1)} j</div>
+                      <div class="card"><b>PR</b>: ${p.overall.n||0}</div>
+                    </div>`;
+                  const labels = p.monthly.map(m=>m.month);
+                  const mMed   = p.monthly.map(m=>m.median);
+                  const mMean  = p.monthly.map(m=>m.mean);
+                  const mP90   = p.monthly.map(m=>m.p90);
+
+                  const canvas = document.createElement("canvas");
+                  sec.appendChild(canvas);
+                  new Chart(canvas, {
+                    type: "line",
+                    data: {
+                      labels,
+                      datasets: [
+                        { label: "Médiane (j)", data: mMed,  borderColor: "#2563eb", tension: .2 },
+                        { label: "Moyenne (j)", data: mMean, borderColor: "#10b981", tension: .2 },
+                        { label: "p90 (j)",     data: mP90,  borderColor: "#f59e0b", tension: .2 }
+                      ]
+                    },
+                    options: { responsive: true, scales: { y: { beginAtZero:true, title:{display:true, text:"jours"} } } }
+                  });
+
+                  const tbl = document.createElement("table");
+                  tbl.innerHTML = `<thead><tr><th>Mois</th><th>PR</th><th>Médiane (j)</th><th>Moyenne (j)</th><th>p90 (j)</th></tr></thead><tbody></tbody>`;
+                  const tbody = tbl.querySelector("tbody");
+                  p.monthly.forEach(m=>{
+                    const tr=document.createElement("tr");
+                    tr.innerHTML = `<td>${m.month}</td><td>${m.n}</td><td>${m.median.toFixed(1)}</td><td>${m.mean.toFixed(1)}</td><td>${m.p90.toFixed(1)}</td>`;
+                    tbody.appendChild(tr);
+                  });
+                  sec.appendChild(tbl);
+                  root.appendChild(sec);
+                });
+              })();
+            </script>
+          </body>
+          </html>
+          HTML
+
+      - name: Configure Pages (official)
         uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
@@ -244,7 +205,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy to GitHub Pages
+      - name: Deploy to GitHub Pages (official)
         id: deployment
         uses: actions/deploy-pages@v4
 ``
